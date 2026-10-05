@@ -3,9 +3,9 @@
 package execenv
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -19,7 +19,7 @@ import (
 	"github.com/multica-ai/multica/server/pkg/agent"
 )
 
-// Real-CLI acceptance for Pi project MCP. Opt-in twice: the agentintegration
+// Real-CLI acceptance for Pi MCP delivery. Opt-in twice: the agentintegration
 // build tag, and MULTICA_RUN_REAL_AGENT_SMOKE, because this executes the pi
 // binary installed on the host. HOME points at a temp directory so the test
 // does not read or write the user's ~/.pi. Pi exits before connecting MCP
@@ -28,14 +28,15 @@ import (
 // That is not the user's account. The oracle is a local stdio program that
 // records its own start.
 func TestPiMcpUntrustedProjectDoesNotStartServer(t *testing.T) {
-	bin, workDir, sentinel := piMcpFixture(t)
+	bin, workDir, sentinel, raw := piMcpFixture(t)
+	writePiProjectMcp(t, workDir, raw)
 
 	sessionPath := filepath.Join(workDir, "session.jsonl")
 	if err := os.WriteFile(sessionPath, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// The stub model never completes, so this context is what ends the process.
-	// The wait is longer than the approved test needs to observe a start.
+	// The wait is longer than the extension test needs to observe a start.
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin,
@@ -79,12 +80,15 @@ func TestPiMcpUntrustedProjectDoesNotStartServer(t *testing.T) {
 	<-done
 }
 
-func TestPiMcpApprovedLaunchStartsServer(t *testing.T) {
-	bin, workDir, sentinel := piMcpFixture(t)
+func TestPiMcpExtensionLaunchStartsServer(t *testing.T) {
+	bin, workDir, sentinel, raw := piMcpFixture(t)
+	extensionTmp := t.TempDir()
+	t.Setenv("TMPDIR", extensionTmp)
 
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	backend, err := agent.New("pi", agent.Config{ExecutablePath: bin, Logger: logger})
 	if err != nil {
 		t.Fatalf("new pi backend: %v", err)
@@ -93,6 +97,7 @@ func TestPiMcpApprovedLaunchStartsServer(t *testing.T) {
 		Cwd:        workDir,
 		Model:      piMcpStubModel,
 		CustomArgs: []string{"--offline"},
+		McpConfig:  raw,
 	})
 	if err != nil {
 		t.Fatalf("execute pi: %v", err)
@@ -107,11 +112,23 @@ func TestPiMcpApprovedLaunchStartsServer(t *testing.T) {
 		}
 	}()
 
+	logged := logBuf.String()
+	if strings.Contains(logged, "--approve") {
+		t.Fatalf("launch args include --approve:\n%s", logged)
+	}
+	if !strings.Contains(logged, "--extension") {
+		t.Fatalf("launch args missing --extension:\n%s", logged)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, ".pi", "mcp.json")); !os.IsNotExist(err) {
+		t.Fatalf("Execute created .pi/mcp.json, stat error = %v", err)
+	}
+
 	deadline := time.Now().Add(25 * time.Second)
+	started := false
 	for time.Now().Before(deadline) {
 		if data, readErr := os.ReadFile(sentinel); readErr == nil && strings.TrimSpace(string(data)) == "started" {
-			cancel()
-			return
+			started = true
+			break
 		}
 		select {
 		case result := <-resultCh:
@@ -119,10 +136,35 @@ func TestPiMcpApprovedLaunchStartsServer(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	t.Fatal("approved pi did not start the MCP server")
+	if !started {
+		t.Fatal("pi extension did not start the MCP server")
+	}
+	cancel()
+	select {
+	case <-resultCh:
+	case <-time.After(15 * time.Second):
+		t.Fatal("pi did not exit after cancel")
+	}
+
+	cleanupDeadline := time.Now().Add(2 * time.Second)
+	for {
+		matches, globErr := filepath.Glob(filepath.Join(extensionTmp, piMcpExtensionGlob))
+		if globErr != nil {
+			t.Fatal(globErr)
+		}
+		if len(matches) == 0 {
+			return
+		}
+		if time.Now().After(cleanupDeadline) {
+			t.Fatalf("temporary pi extension still present: %v", matches)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
-func piMcpFixture(t *testing.T) (bin, workDir, sentinel string) {
+const piMcpExtensionGlob = "multica-pi-mcp-*"
+
+func piMcpFixture(t *testing.T) (bin, workDir, sentinel string, raw json.RawMessage) {
 	t.Helper()
 	if os.Getenv("MULTICA_RUN_REAL_AGENT_SMOKE") != "1" {
 		t.Skip("set MULTICA_RUN_REAL_AGENT_SMOKE=1 to allow real agent CLI access")
@@ -155,7 +197,7 @@ func piMcpFixture(t *testing.T) (bin, workDir, sentinel string) {
 	if err := os.WriteFile(probe, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := json.Marshal(map[string]any{
+	raw, err = json.Marshal(map[string]any{
 		"mcpServers": map[string]any{
 			"probe": map[string]any{
 				"command": probe,
@@ -166,13 +208,18 @@ func piMcpFixture(t *testing.T) (bin, workDir, sentinel string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := preparePiMcpConfig(workDir, "pi", raw, &sidecarManifest{}); err != nil {
-		t.Fatalf("prepare pi mcp config: %v", err)
+	return bin, workDir, sentinel, raw
+}
+
+func writePiProjectMcp(t *testing.T, workDir string, raw []byte) {
+	t.Helper()
+	path := filepath.Join(workDir, ".pi", "mcp.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(workDir, ".pi", "mcp.json")); err != nil {
-		t.Fatalf("project mcp.json missing: %v", err)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
 	}
-	return bin, workDir, sentinel
 }
 
 const piMcpStubModel = "localstub/stub"

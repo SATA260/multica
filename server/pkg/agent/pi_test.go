@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -31,13 +32,16 @@ func TestBuildPiArgsBasicFlags(t *testing.T) {
 	}, slog.Default())
 
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"-p", "--mode json", "--session /tmp/s.jsonl", "--model anthropic/claude-sonnet-4-20250514", "--thinking high", "--approve"} {
+	for _, want := range []string{"-p", "--mode json", "--session /tmp/s.jsonl", "--model anthropic/claude-sonnet-4-20250514", "--thinking high"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("expected %q in args, got: %v", want, args)
 		}
 	}
-	if got := countArg(args, "--approve"); got != 1 {
-		t.Errorf("--approve count = %d, want 1 in %v", got, args)
+	if got := countArg(args, "--approve"); got != 0 {
+		t.Errorf("--approve count = %d, want 0 in %v", got, args)
+	}
+	if countArg(args, "--extension") != 0 {
+		t.Errorf("extension flag without a managed config: %v", args)
 	}
 
 	for _, arg := range args {
@@ -50,24 +54,39 @@ func TestBuildPiArgsBasicFlags(t *testing.T) {
 // Pi reads the per-task AGENTS.md the daemon writes into the workdir, so the
 // daemon never populates SystemPrompt for it (providerNeedsInlineSystemPrompt).
 // Forwarding it anyway would duplicate the whole runtime brief on every turn.
-func TestBuildPiArgsApprovesProjectAndStripsTrustOverrides(t *testing.T) {
+func TestBuildPiArgsStripsProjectTrustFlags(t *testing.T) {
 	args := buildPiArgs("/tmp/s.jsonl", ExecOptions{
 		CustomArgs: []string{"--no-approve", "-a", "--approve", "-na", "--offline"},
 	}, slog.Default())
 
-	if got := countArg(args, "--approve"); got != 1 {
-		t.Fatalf("--approve count = %d, want 1 in %v", got, args)
+	if got := countArg(args, "--approve"); got != 0 {
+		t.Fatalf("--approve count = %d, want 0 in %v", got, args)
 	}
-	if args[len(args)-1] != "--approve" {
-		t.Fatalf("last arg = %q, want --approve after custom args: %v", args[len(args)-1], args)
+	if countArg(args, "-a") != 0 {
+		t.Fatalf("custom -a survived in %v", args)
 	}
-	for _, blocked := range []string{"--no-approve", "-na", "-a"} {
-		if countArg(args, blocked) != 0 {
-			t.Errorf("custom %s survived in %v", blocked, args)
+	for _, kept := range []string{"--no-approve", "-na", "--offline"} {
+		if countArg(args, kept) != 1 {
+			t.Errorf("custom %s missing from %v", kept, args)
 		}
 	}
+}
+
+func TestBuildPiArgsAppendsMcpExtension(t *testing.T) {
+	extensionPath := "/tmp/multica-pi-mcp-test/mcp-extension.mjs"
+	args := buildPiArgs("/tmp/s.jsonl", ExecOptions{
+		CustomArgs:         []string{"--offline", "--approve"},
+		piMcpExtensionPath: extensionPath,
+	}, slog.Default())
+
+	if countArg(args, "--approve") != 0 {
+		t.Fatalf("--approve survived in %v", args)
+	}
+	if len(args) < 2 || args[len(args)-2] != "--extension" || args[len(args)-1] != extensionPath {
+		t.Fatalf("args = %v, want --extension %s at the end", args, extensionPath)
+	}
 	if countArg(args, "--offline") != 1 {
-		t.Errorf("unrelated custom flag was dropped: %v", args)
+		t.Fatalf("custom --offline missing from %v", args)
 	}
 }
 
@@ -899,5 +918,124 @@ func TestBuildPiArgsBareAndEmptyModels(t *testing.T) {
 		if arg == "--model" {
 			t.Errorf("blank model should omit --model so pi picks its default: %v", empty)
 		}
+	}
+}
+
+func TestWritePiMcpExtensionFiltersAndLeavesProjectFile(t *testing.T) {
+	workDir := t.TempDir()
+	projectPath := filepath.Join(workDir, ".pi", "mcp.json")
+	if err := os.MkdirAll(filepath.Dir(projectPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	existing := []byte(`{"mcpServers":{"user":{"command":"echo"}}}`)
+	if err := os.WriteFile(projectPath, existing, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := json.RawMessage(`{
+		"mcpServers": {
+			"probe": {"command": "echo", "args": ["hi"]},
+			"bad name": {"command": "nope"},
+			"legacy": {"type": "sse", "url": "http://example.invalid"}
+		}
+	}`)
+	path, err := writePiMcpExtension(raw, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path == "" {
+		t.Fatal("expected an extension file")
+	}
+	t.Cleanup(func() { removePiMcpExtension(path) })
+
+	if !strings.HasPrefix(filepath.Base(filepath.Dir(path)), piMcpExtensionDirPrefix) {
+		t.Fatalf("extension dir = %s, want %s prefix", path, piMcpExtensionDirPrefix)
+	}
+	if filepath.Base(path) != "mcp-extension.mjs" {
+		t.Fatalf("extension file = %s", path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("extension mode = %o, want 600", info.Mode().Perm())
+	}
+	script, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, want := range []string{"registerMcpServer", "probe", "echo"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("script missing %q:\n%s", want, text)
+		}
+	}
+	for _, absent := range []string{"bad name", "legacy", "example.invalid"} {
+		if strings.Contains(text, absent) {
+			t.Fatalf("script contains skipped server %q:\n%s", absent, text)
+		}
+	}
+
+	data, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != string(existing) {
+		t.Fatalf("project mcp.json changed to %s", data)
+	}
+
+	args := buildPiArgs("/tmp/s.jsonl", ExecOptions{piMcpExtensionPath: path}, slog.Default())
+	if len(args) < 2 || args[len(args)-2] != "--extension" || args[len(args)-1] != path {
+		t.Fatalf("args = %v, want extension %s", args, path)
+	}
+	if countArg(args, "--approve") != 0 {
+		t.Fatalf("--approve present in %v", args)
+	}
+}
+
+func TestWritePiMcpExtensionSkipsUnmanagedAndEmpty(t *testing.T) {
+	for _, raw := range []json.RawMessage{nil, json.RawMessage("null"), json.RawMessage(`{}`), json.RawMessage(`{"mcpServers":{}}`)} {
+		path, err := writePiMcpExtension(raw, slog.Default())
+		if err != nil {
+			t.Fatalf("writePiMcpExtension(%s): %v", raw, err)
+		}
+		if path != "" {
+			removePiMcpExtension(path)
+			t.Fatalf("writePiMcpExtension(%s) wrote %s", raw, path)
+		}
+	}
+
+	path, err := writePiMcpExtension(json.RawMessage(`{"mcpServers":{"bad name":{"command":"echo"},"legacy":{"type":"sse"}}}`), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "" {
+		removePiMcpExtension(path)
+		t.Fatalf("filtered config still wrote %s", path)
+	}
+}
+
+func TestRemovePiMcpExtensionIgnoresOtherPaths(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mcp-extension.mjs")
+	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removePiMcpExtension(path)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("unrelated extension file was removed: %v", err)
+	}
+}
+
+func TestPreparePiMcpExtensionSkipsOmp(t *testing.T) {
+	backend := &piBackend{providerLabel: "omp"}
+	path, err := backend.preparePiMcpExtension(json.RawMessage(`{"mcpServers":{"probe":{"command":"echo"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "" {
+		removePiMcpExtension(path)
+		t.Fatalf("omp wrote a pi extension at %s", path)
 	}
 }

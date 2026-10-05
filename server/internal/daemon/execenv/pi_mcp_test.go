@@ -2,49 +2,41 @@ package execenv
 
 import (
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
-func TestPreparePiMcpConfigUsesPiNamespace(t *testing.T) {
-	workDir := t.TempDir()
-	manifest := &sidecarManifest{}
-	raw := json.RawMessage(`{"mcpServers":{"fetch":{"command":"uvx"}}}`)
+func TestPreparePiLeavesProjectMcpConfigAlone(t *testing.T) {
+	t.Parallel()
+	workspacesRoot := t.TempDir()
 
-	if err := preparePiMcpConfig(workDir, "pi", raw, manifest); err != nil {
-		t.Fatalf("preparePiMcpConfig: %v", err)
-	}
-	path := filepath.Join(workDir, ".pi", "mcp.json")
-	data, err := os.ReadFile(path)
+	env, err := Prepare(PrepareParams{
+		WorkspacesRoot: workspacesRoot,
+		WorkspaceID:    "ws-pi-mcp",
+		TaskID:         "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+		AgentName:      "Pi",
+		Provider:       "pi",
+		McpConfig:      json.RawMessage(`{"mcpServers":{"probe":{"command":"echo"}}}`),
+		Task: TaskContextForEnv{
+			IssueID: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+		},
+	}, testLogger())
 	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
+		t.Fatalf("Prepare: %v", err)
 	}
-	if string(data) != string(raw) {
-		t.Fatalf("config = %s, want %s", data, raw)
-	}
-	if !containsPath(manifest.Files, path) || !containsPath(manifest.Dirs, filepath.Dir(path)) {
-		t.Fatalf("manifest = %#v, want config file and directory", manifest)
+	defer env.Cleanup(true)
+
+	if _, err := os.Stat(filepath.Join(env.WorkDir, ".pi", "mcp.json")); !os.IsNotExist(err) {
+		t.Fatalf("Prepare created .pi/mcp.json, stat error = %v", err)
 	}
 }
 
-func TestPreparePiMcpConfigSkipsEmptyDocument(t *testing.T) {
-	workDir := t.TempDir()
-	for _, raw := range []json.RawMessage{nil, json.RawMessage("null"), json.RawMessage("  ")} {
-		if err := preparePiMcpConfig(workDir, "pi", raw, &sidecarManifest{}); err != nil {
-			t.Fatalf("preparePiMcpConfig(%q): %v", raw, err)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(workDir, ".pi", "mcp.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("empty config created a file, stat error = %v", err)
-	}
-}
-
-func TestPreparePiMcpConfigRefusesExistingManagedPath(t *testing.T) {
-	workDir := t.TempDir()
-	path := filepath.Join(workDir, ".pi", "mcp.json")
+func TestPreparePiDoesNotOverwriteExistingProjectMcpConfig(t *testing.T) {
+	t.Parallel()
+	workspacesRoot := t.TempDir()
+	userDir := t.TempDir()
+	path := filepath.Join(userDir, ".pi", "mcp.json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -53,29 +45,28 @@ func TestPreparePiMcpConfigRefusesExistingManagedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := preparePiMcpConfig(workDir, "pi", json.RawMessage(`{"mcpServers":{"managed":{}}}`), &sidecarManifest{})
-	if err == nil || !strings.Contains(err.Error(), "would overwrite") {
-		t.Fatalf("error = %v, want overwrite error", err)
+	env, err := Prepare(PrepareParams{
+		WorkspacesRoot: workspacesRoot,
+		WorkspaceID:    "ws-pi-mcp-existing",
+		TaskID:         "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+		AgentName:      "Pi",
+		Provider:       "pi",
+		LocalWorkDir:   userDir,
+		McpConfig:      json.RawMessage(`{"mcpServers":{"managed":{"command":"echo"}}}`),
+		Task: TaskContextForEnv{
+			IssueID: "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+		},
+	}, testLogger())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
 	}
-	data, readErr := os.ReadFile(path)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if string(data) != string(existing) {
-		t.Fatalf("existing config changed to %s", data)
-	}
-}
+	defer env.Cleanup(true)
 
-func TestPreparePiMcpConfigIgnoresOtherProviders(t *testing.T) {
-	workDir := t.TempDir()
-	raw := json.RawMessage(`{"mcpServers":{"fetch":{"command":"uvx"}}}`)
-	if err := preparePiMcpConfig(workDir, "omp", raw, &sidecarManifest{}); err != nil {
+	data, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(workDir, ".pi", "mcp.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("pi config written for omp, stat error = %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(workDir, ".omp", "mcp.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("omp config written by pi preparer, stat error = %v", err)
+	if string(data) != string(existing) {
+		t.Fatalf("existing .pi/mcp.json changed to %s", data)
 	}
 }

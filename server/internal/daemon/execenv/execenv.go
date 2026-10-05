@@ -605,9 +605,6 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	if err := prepareOmpMcpConfig(workDir, params.Provider, params.McpConfig, manifest); err != nil {
 		return nil, fmt.Errorf("execenv: prepare omp mcp config: %w", err)
 	}
-	if err := preparePiMcpConfig(workDir, params.Provider, params.McpConfig, manifest); err != nil {
-		return nil, fmt.Errorf("execenv: prepare pi mcp config: %w", err)
-	}
 
 	// Persist managed-env provenance for non-local resumable envs at Prepare time
 	// (not on completion, where .gc_meta.json is written). A same-issue
@@ -906,10 +903,6 @@ func Reuse(params ReuseParams, logger *slog.Logger) *Environment {
 	}
 	if err := prepareOmpMcpConfig(params.WorkDir, params.Provider, params.McpConfig, manifest); err != nil {
 		logger.Warn("execenv: refresh omp mcp config failed; forcing fresh prepare", "error", err)
-		return nil
-	}
-	if err := preparePiMcpConfig(params.WorkDir, params.Provider, params.McpConfig, manifest); err != nil {
-		logger.Warn("execenv: refresh pi mcp config failed; forcing fresh prepare", "error", err)
 		return nil
 	}
 
