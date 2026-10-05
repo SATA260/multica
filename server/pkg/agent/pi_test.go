@@ -31,10 +31,13 @@ func TestBuildPiArgsBasicFlags(t *testing.T) {
 	}, slog.Default())
 
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"-p", "--mode json", "--session /tmp/s.jsonl", "--model anthropic/claude-sonnet-4-20250514", "--thinking high"} {
+	for _, want := range []string{"-p", "--mode json", "--session /tmp/s.jsonl", "--model anthropic/claude-sonnet-4-20250514", "--thinking high", "--approve"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("expected %q in args, got: %v", want, args)
 		}
+	}
+	if got := countArg(args, "--approve"); got != 1 {
+		t.Errorf("--approve count = %d, want 1 in %v", got, args)
 	}
 
 	for _, arg := range args {
@@ -47,6 +50,37 @@ func TestBuildPiArgsBasicFlags(t *testing.T) {
 // Pi reads the per-task AGENTS.md the daemon writes into the workdir, so the
 // daemon never populates SystemPrompt for it (providerNeedsInlineSystemPrompt).
 // Forwarding it anyway would duplicate the whole runtime brief on every turn.
+func TestBuildPiArgsApprovesProjectAndStripsTrustOverrides(t *testing.T) {
+	args := buildPiArgs("/tmp/s.jsonl", ExecOptions{
+		CustomArgs: []string{"--no-approve", "-a", "--approve", "-na", "--offline"},
+	}, slog.Default())
+
+	if got := countArg(args, "--approve"); got != 1 {
+		t.Fatalf("--approve count = %d, want 1 in %v", got, args)
+	}
+	if args[len(args)-1] != "--approve" {
+		t.Fatalf("last arg = %q, want --approve after custom args: %v", args[len(args)-1], args)
+	}
+	for _, blocked := range []string{"--no-approve", "-na", "-a"} {
+		if countArg(args, blocked) != 0 {
+			t.Errorf("custom %s survived in %v", blocked, args)
+		}
+	}
+	if countArg(args, "--offline") != 1 {
+		t.Errorf("unrelated custom flag was dropped: %v", args)
+	}
+}
+
+func countArg(args []string, want string) int {
+	n := 0
+	for _, arg := range args {
+		if arg == want {
+			n++
+		}
+	}
+	return n
+}
+
 func TestBuildPiArgsIgnoresSystemPrompt(t *testing.T) {
 	args := buildPiArgs("/tmp/s.jsonl", ExecOptions{
 		SystemPrompt: "the entire multica runtime brief",

@@ -912,11 +912,15 @@ func decodePiResult(raw json.RawMessage) string {
 // overridden by user-configured custom_args. Overriding these would
 // break the daemon↔Pi communication protocol.
 var piBlockedArgs = map[string]blockedArgMode{
-	"-p":         blockedStandalone, // non-interactive mode
-	"--print":    blockedStandalone, // alias for -p
-	"--mode":     blockedWithValue,  // "json" event stream protocol
-	"--session":  blockedWithValue,  // daemon manages the session path
-	"--thinking": blockedWithValue,  // owned by agent.thinking_level
+	"-p":           blockedStandalone, // non-interactive mode
+	"--print":      blockedStandalone, // alias for -p
+	"--mode":       blockedWithValue,  // "json" event stream protocol
+	"--session":    blockedWithValue,  // daemon manages the session path
+	"--thinking":   blockedWithValue,  // owned by agent.thinking_level
+	"--approve":    blockedStandalone, // daemon trusts the task workdir
+	"-a":           blockedStandalone,
+	"--no-approve": blockedStandalone, // would hide the task's .pi/mcp.json
+	"-na":          blockedStandalone,
 }
 
 // piCustomArgModes mirrors Pi 0.83's built-in parser closely enough to
@@ -1025,6 +1029,10 @@ func buildPiArgs(sessionPath string, opts ExecOptions, logger *slog.Logger) []st
 	// inlining the same runtime brief would duplicate it on every turn.
 	// Verified against Pi 0.67.2 (MUL-5392).
 	args = append(args, filterPiCustomArgs(opts.CustomArgs, logger)...)
+	// JSON mode does not prompt for project trust, so a task's .pi/mcp.json
+	// and .pi/skills are skipped unless this process approves the workdir.
+	// Appended last, after custom args have had their own trust flags removed.
+	args = append(args, "--approve")
 	return args
 }
 
