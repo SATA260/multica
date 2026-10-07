@@ -140,10 +140,14 @@ function isTerminal(issue: Pick<SearchIndexIssue, "status" | "status_category">)
   return category === "done" || category === "closed";
 }
 
-/** Server parseQueryNumber: "MUL-123" or a bare "123". */
+/**
+ * "MUL-123", "V2-12", or a bare "123". The prefix matches a bare issue
+ * identifier (`[A-Z][A-Z0-9]*`), so a digit inside the prefix still selects
+ * that issue number. A leading digit (`12-3`) is not an identifier.
+ */
 function parseQueryNumber(query: string): number | null {
   const q = query.trim();
-  const match = /^[a-z]+-(\d+)$/i.exec(q) ?? /^(\d+)$/.exec(q);
+  const match = /^[a-z][a-z0-9]*-(\d+)$/i.exec(q) ?? /^(\d+)$/.exec(q);
   if (!match) return null;
   const n = Number.parseInt(match[1]!, 10);
   return Number.isInteger(n) && n > 0 ? n : null;

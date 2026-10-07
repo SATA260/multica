@@ -156,6 +156,15 @@ describe("SearchIndexEngine.searchIssues ranking", () => {
     expect(engine.searchIssues({ q: "4242" }).map((h) => h.id)).toEqual([target.id, textHit.id]);
   });
 
+  it("finds an issue by an identifier whose prefix contains a digit", () => {
+    const target = issue({ title: "no text overlap", number: 12, identifier: "V2-12" });
+    const other = issue({ title: "unrelated work" });
+    const engine = engineWith([other, target]);
+
+    expect(engine.searchIssues({ q: "V2-12" }).map((h) => h.id)).toEqual([target.id]);
+    expect(engine.searchIssues({ q: "v2-12" }).map((h) => h.id)).toEqual([target.id]);
+  });
+
   it("demotes cancelled issues unless the query targets them directly", () => {
     const cancelled = issue({ title: "billing export", status: "cancelled" });
     const live = issue({ title: "old billing export job", status: "done" });

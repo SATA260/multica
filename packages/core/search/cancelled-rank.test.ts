@@ -39,6 +39,17 @@ describe("parseSearchQueryNumber", () => {
     expect(parseSearchQueryNumber("  123 ")).toBe(123);
   });
 
+  it("reads the issue number when the prefix itself contains a digit", () => {
+    // Prefixes may be V2 / A1 / BUG2 (`[A-Z][A-Z0-9]*`). A letter-only
+    // pattern drops those, so a mention of issue 12 keyed only by "V2-12"
+    // is not treated as a direct hit and a cancelled row is demoted away.
+    expect(parseSearchQueryNumber("V2-12")).toBe(12);
+    expect(parseSearchQueryNumber("a1-7")).toBe(7);
+    expect(parseSearchQueryNumber("BUG2-9")).toBe(9);
+    // Not an identifier: a leading digit is a different token, not issue 3.
+    expect(parseSearchQueryNumber("12-3")).toBeNull();
+  });
+
   it("returns null for anything that is not a target", () => {
     expect(parseSearchQueryNumber("search")).toBeNull();
     expect(parseSearchQueryNumber("MUL-")).toBeNull();
@@ -73,6 +84,15 @@ describe("direct hits", () => {
     expect(isIssueDirectHit(row, "Abandoned plan")).toBe(true);
     expect(isIssueDirectHit(row, "plan")).toBe(false);
     expect(isIssueDirectHit(row, "78")).toBe(false);
+  });
+
+  it("derives the number from a digit-containing prefix when number is absent", () => {
+    // Mention rows carry the identifier in the label and no `number`.
+    const row = { identifier: "V2-12", title: "Abandoned plan" };
+    expect(isIssueDirectHit(row, "12")).toBe(true);
+    expect(isIssueDirectHit(row, "V2-12")).toBe(true);
+    expect(isIssueDirectHit(row, "v2-12")).toBe(true);
+    expect(isIssueDirectHit(row, "13")).toBe(false);
   });
 
   it("prefers an explicit number over the identifier", () => {

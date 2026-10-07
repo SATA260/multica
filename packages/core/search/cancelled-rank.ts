@@ -23,10 +23,12 @@ import type { SearchIssueResult, SearchProjectResult } from "../types/api";
 import { issueBehavesAs } from "../issues/status-category";
 
 /**
- * Mirrors the server's identifier pattern (parseQueryNumber in
- * server/internal/handler/issue.go): "MUL-123" or a bare "123".
+ * Same shape as a bare issue identifier (`[A-Z][A-Z0-9]*-<number>`): "MUL-123",
+ * "V2-12", or a bare "123". A letter-only prefix (`[a-z]+`) drops any prefix
+ * that itself contains a digit, so "V2-12" was not recognized as issue 12.
+ * A leading digit is not an identifier (`12-3` stays a non-match).
  */
-const IDENTIFIER_NUMBER_RE = /^[a-z]+-(\d+)$/i;
+const IDENTIFIER_NUMBER_RE = /^[a-z][a-z0-9]*-(\d+)$/i;
 
 /** Extracts the issue number a query targets, or null when it targets none. */
 export function parseSearchQueryNumber(query: string): number | null {
