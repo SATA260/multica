@@ -314,7 +314,7 @@ docker compose -f docker-compose.selfhost.yml up -d
 実際に動くバージョンを決めるのは `docker compose pull` で、そのタグが今どのイメージを指しているかを GHCR に問い合わせます。したがって数か月更新していない checkout でも今日の `latest` イメージを取得できますし、逆に `git pull` だけではイメージを取得してコンテナを作り直すまで何も変わりません。
 
 <Callout type="warning">
-**`MULTICA_IMAGE_TAG` を固定している場合、どちらのコマンドでもアップグレードされません。** 両方のイメージが `${MULTICA_IMAGE_TAG:-latest}` として解決され（`docker-compose.selfhost.yml:42`、`:125`）、`.env.example` は `MULTICA_IMAGE_TAG=latest` を同梱しています。`.env` で特定のリリースに固定していると、`pull` は同じタグを取り直すだけで、古いバージョンのままです — エラーも警告も出ません。アップグレード前に確認してください。
+**`MULTICA_IMAGE_TAG` を固定している場合、どちらのコマンドでもアップグレードされません。** 両方のイメージが `${MULTICA_IMAGE_TAG:-latest}` として解決され（`docker-compose.selfhost.yml:56`、`:222`）、`.env.example` は `MULTICA_IMAGE_TAG=latest` を同梱しています。`.env` で特定のリリースに固定していると、`pull` は同じタグを取り直すだけで、古いバージョンのままです — エラーも警告も出ません。アップグレード前に確認してください。
 
 ```bash
 grep MULTICA_IMAGE_TAG .env
