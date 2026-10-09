@@ -1473,6 +1473,35 @@ func TestLoadConfig_UsesNestedChatGPTCodexCLIPath(t *testing.T) {
 	}
 }
 
+// A bundled CLI that exists but cannot be spawned must stay unregistered:
+// registering it would advertise a healthy runtime whose every task fails.
+func TestProbeAgentCLIsIgnoresNonExecutableCodexBundle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Codex Desktop app bundle fallback is macOS-only")
+	}
+
+	pathDir := t.TempDir()
+	nested := filepath.Join(pathDir, "ChatGPT.app", "Contents", "Resources", "codex-cli", "bin", "codex")
+	if err := os.MkdirAll(filepath.Dir(nested), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(nested, []byte("#!/bin/sh\nexit 0\n"), 0o644); err != nil {
+		t.Fatalf("write non-executable fake CLI: %v", err)
+	}
+
+	oldBundlePaths := codexDesktopAppBundlePaths
+	codexDesktopAppBundlePaths = func() []string { return []string{nested} }
+	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
+
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
+	pinNonCodexAgentsToMissingPaths(t)
+
+	if _, found := probeAgentCLIs()["codex"]; found {
+		t.Fatal("codex was registered from a non-executable app bundle path")
+	}
+}
+
 // When both the nested CLI and the older flat binary exist, the nested path
 // is the current ChatGPT.app layout and must win.
 func TestLoadConfig_PrefersNestedChatGPTCodexCLIPath(t *testing.T) {
