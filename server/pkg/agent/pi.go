@@ -937,8 +937,6 @@ var piBlockedArgs = map[string]blockedArgMode{
 	"--mode":     blockedWithValue,  // "json" event stream protocol
 	"--session":  blockedWithValue,  // daemon manages the session path
 	"--thinking": blockedWithValue,  // owned by agent.thinking_level
-	"--approve":  blockedStandalone, // would trust the whole project .pi directory
-	"-a":         blockedStandalone,
 }
 
 // piCustomArgModes mirrors Pi 0.83's built-in parser closely enough to
@@ -1048,14 +1046,23 @@ func buildPiArgs(sessionPath string, opts ExecOptions, logger *slog.Logger) []st
 	// Verified against Pi 0.67.2 (MUL-5392).
 	args = append(args, filterPiCustomArgs(opts.CustomArgs, logger)...)
 	// The extension is explicit, so Pi loads it without trusting the project.
-	// It stays after custom args, which are not allowed to supply their own.
+	// It stays after custom args so the managed path cannot be mistaken for the
+	// value of an extension-defined flag. A user-provided --approve remains
+	// independent and continues to opt into all project-local Pi resources.
 	if opts.piMcpExtensionPath != "" {
 		args = append(args, "--extension", opts.piMcpExtensionPath)
 	}
 	return args
 }
 
-const piMcpExtensionDirPrefix = "multica-pi-mcp-"
+const (
+	piMcpExtensionDirPrefix = "multica-pi-mcp-"
+	// Pi 0.99.0 introduced the built-in MCP extension and the
+	// registerMcpServer API used by the task-local adapter below. This is a
+	// capability floor, not a global Pi floor: older Pi installations keep
+	// working for agents without managed MCP configuration.
+	piMcpMinVersion = "0.99.0"
+)
 
 // preparePiMcpExtension writes Pi's own temporary extension. omp shares this
 // backend but keeps its project mcp.json, so it never gets this file.
@@ -1063,18 +1070,40 @@ func (b *piBackend) preparePiMcpExtension(raw json.RawMessage) (string, error) {
 	if b.providerLabel == "omp" || !hasManagedMcpConfig(raw) {
 		return "", nil
 	}
-	return writePiMcpExtension(raw, b.cfg.Logger)
+	if err := b.validatePiMcpVersion(); err != nil {
+		return "", err
+	}
+	return writePiMcpExtension(raw)
+}
+
+func (b *piBackend) validatePiMcpVersion() error {
+	// Custom runtime profiles only promise Pi's JSON protocol, not the vendor's
+	// version scheme. Their explicit extension load remains the capability
+	// probe; applying Pi's vendor floor would reject compatible wrappers.
+	if !b.cfg.BuiltinRuntime {
+		return nil
+	}
+	detected, err := parseSemver(b.cfg.CLIVersion)
+	if err != nil {
+		return fmt.Errorf("pi MCP requires a newer version: %s or later; could not verify detected version %q; upgrade Pi or remove the MCP configuration", piMcpMinVersion, b.cfg.CLIVersion)
+	}
+	minimum, _ := parseSemver(piMcpMinVersion)
+	if detected.lessThan(minimum) {
+		return fmt.Errorf("pi MCP requires a newer version: %s or later (detected %s); upgrade Pi or remove the MCP configuration", piMcpMinVersion, b.cfg.CLIVersion)
+	}
+	return nil
 }
 
 // writePiMcpExtension writes mcp-extension.mjs under a multica-pi-mcp-*
-// directory. An empty server list after filtering returns an empty path and
-// leaves no directory behind. The caller deletes the directory with
-// removePiMcpExtension.
-func writePiMcpExtension(raw json.RawMessage, logger *slog.Logger) (string, error) {
+// directory. An empty server list returns an empty path and leaves no
+// directory behind. The caller deletes the directory with
+// removePiMcpExtension. Pi validates each server; the generated extension
+// isolates those errors so one malformed entry cannot suppress valid servers.
+func writePiMcpExtension(raw json.RawMessage) (string, error) {
 	if !hasManagedMcpConfig(raw) {
 		return "", nil
 	}
-	servers, err := piMcpExtensionServers(raw, logger)
+	servers, err := piMcpExtensionServers(raw)
 	if err != nil {
 		return "", err
 	}
@@ -1091,8 +1120,16 @@ func writePiMcpExtension(raw json.RawMessage, logger *slog.Logger) (string, erro
 	}
 	script := "const servers = JSON.parse(" + string(literal) + ");\n" +
 		"export default function (pi) {\n" +
+		"  if (typeof pi.registerMcpServer !== \"function\") {\n" +
+		"    throw new Error(\"Multica MCP delivery requires Pi " + piMcpMinVersion + " or newer\");\n" +
+		"  }\n" +
 		"  for (const [name, config] of Object.entries(servers)) {\n" +
-		"    pi.registerMcpServer(name, config);\n" +
+		"    try {\n" +
+		"      pi.registerMcpServer(name, config);\n" +
+		"    } catch (error) {\n" +
+		"      const reason = error instanceof Error ? error.message : String(error);\n" +
+		"      console.error(\"[multica] could not register MCP server \" + JSON.stringify(name) + \": \" + reason);\n" +
+		"    }\n" +
 		"  }\n" +
 		"}\n"
 	dir, err := os.MkdirTemp("", piMcpExtensionDirPrefix)
@@ -1120,7 +1157,7 @@ func removePiMcpExtension(path string) {
 	_ = os.RemoveAll(dir)
 }
 
-func piMcpExtensionServers(raw json.RawMessage, logger *slog.Logger) (map[string]json.RawMessage, error) {
+func piMcpExtensionServers(raw json.RawMessage) (map[string]json.RawMessage, error) {
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("parse mcp_config: %w", err)
@@ -1133,46 +1170,7 @@ func piMcpExtensionServers(raw json.RawMessage, logger *slog.Logger) (map[string
 	if err := json.Unmarshal(rawServers, &servers); err != nil {
 		return nil, fmt.Errorf("parse mcp_config mcpServers: %w", err)
 	}
-	kept := make(map[string]json.RawMessage, len(servers))
-	for name, entry := range servers {
-		if !piMcpServerNameOK(name) {
-			piMcpSkip(logger, name, "invalid name")
-			continue
-		}
-		var cfg map[string]json.RawMessage
-		if err := json.Unmarshal(entry, &cfg); err != nil || cfg == nil {
-			piMcpSkip(logger, name, "server config is not an object")
-			continue
-		}
-		if typ, ok := cfg["type"]; ok {
-			var typeName string
-			if err := json.Unmarshal(typ, &typeName); err == nil && strings.EqualFold(typeName, "sse") {
-				piMcpSkip(logger, name, "legacy sse transport is not supported")
-				continue
-			}
-		}
-		kept[name] = entry
-	}
-	return kept, nil
-}
-
-func piMcpServerNameOK(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i := 0; i < len(name); i++ {
-		if !isPiToolNameByte(name[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-func piMcpSkip(logger *slog.Logger, name, reason string) {
-	if logger == nil {
-		return
-	}
-	logger.Warn("pi mcp: skipping server", "name", name, "reason", reason)
+	return servers, nil
 }
 
 // filterPiCustomArgs removes @file and positional message inputs from

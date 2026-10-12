@@ -8,11 +8,14 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,8 +28,9 @@ import (
 // does not read or write the user's ~/.pi. Pi exits before connecting MCP
 // when the temp home has no model credential, so the fixture points --model
 // at a local listener that accepts the request and never returns a completion.
-// That is not the user's account. The oracle is a local stdio program that
-// records its own start.
+// That is not the user's account. The oracles are a local stdio program that
+// records its own start and a local Streamable HTTP server that records Pi's
+// initialize request.
 func TestPiMcpUntrustedProjectDoesNotStartServer(t *testing.T) {
 	bin, workDir, sentinel, raw := piMcpFixture(t)
 	writePiProjectMcp(t, workDir, raw)
@@ -82,6 +86,21 @@ func TestPiMcpUntrustedProjectDoesNotStartServer(t *testing.T) {
 
 func TestPiMcpExtensionLaunchStartsServer(t *testing.T) {
 	bin, workDir, sentinel, raw := piMcpFixture(t)
+	httpURL, httpInitialized := piHTTPMCPProbe(t)
+	var config struct {
+		McpServers map[string]any `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatal(err)
+	}
+	config.McpServers["remote-probe"] = map[string]any{
+		"type": "http",
+		"url":  httpURL,
+	}
+	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
 	extensionTmp := t.TempDir()
 	t.Setenv("TMPDIR", extensionTmp)
 
@@ -89,7 +108,12 @@ func TestPiMcpExtensionLaunchStartsServer(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	backend, err := agent.New("pi", agent.Config{ExecutablePath: bin, Logger: logger})
+	backend, err := agent.New("pi", agent.Config{
+		ExecutablePath: bin,
+		CLIVersion:     "1.0.2",
+		BuiltinRuntime: true,
+		Logger:         logger,
+	})
 	if err != nil {
 		t.Fatalf("new pi backend: %v", err)
 	}
@@ -124,20 +148,22 @@ func TestPiMcpExtensionLaunchStartsServer(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(25 * time.Second)
-	started := false
-	for time.Now().Before(deadline) {
+	stdioStarted := false
+	httpStarted := false
+	for time.Now().Before(deadline) && (!stdioStarted || !httpStarted) {
 		if data, readErr := os.ReadFile(sentinel); readErr == nil && strings.TrimSpace(string(data)) == "started" {
-			started = true
-			break
+			stdioStarted = true
 		}
 		select {
+		case <-httpInitialized:
+			httpStarted = true
 		case result := <-resultCh:
-			t.Fatalf("pi exited before starting the MCP server: status=%s error=%s output=%s", result.Status, result.Error, result.Output)
+			t.Fatalf("pi exited before starting both MCP servers: status=%s error=%s output=%s", result.Status, result.Error, result.Output)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	if !started {
-		t.Fatal("pi extension did not start the MCP server")
+	if !stdioStarted || !httpStarted {
+		t.Fatalf("pi extension starts: stdio=%v http=%v", stdioStarted, httpStarted)
 	}
 	cancel()
 	select {
@@ -160,6 +186,59 @@ func TestPiMcpExtensionLaunchStartsServer(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func piHTTPMCPProbe(t *testing.T) (string, <-chan struct{}) {
+	t.Helper()
+	initialized := make(chan struct{})
+	var once sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var request struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id,omitempty"`
+			Method  string          `json:"method"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if request.Method == "notifications/initialized" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		var result any
+		switch request.Method {
+		case "initialize":
+			once.Do(func() { close(initialized) })
+			result = map[string]any{
+				"protocolVersion": "2024-11-05",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]any{"name": "pi-http-probe", "version": "1"},
+			}
+		case "tools/list":
+			result = map[string]any{"tools": []any{}}
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request.ID,
+				"error":   map[string]any{"code": -32601, "message": "method not found"},
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      request.ID,
+			"result":  result,
+		})
+	}))
+	t.Cleanup(server.Close)
+	return server.URL + "/mcp", initialized
 }
 
 const piMcpExtensionGlob = "multica-pi-mcp-*"
