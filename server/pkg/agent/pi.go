@@ -1070,6 +1070,13 @@ func (b *piBackend) preparePiMcpExtension(raw json.RawMessage) (string, error) {
 	if b.providerLabel == "omp" || !hasManagedMcpConfig(raw) {
 		return "", nil
 	}
+	servers, err := piMcpExtensionServers(raw)
+	if err != nil {
+		return "", err
+	}
+	if len(servers) == 0 {
+		return "", nil
+	}
 	if err := b.validatePiMcpVersion(); err != nil {
 		return "", err
 	}

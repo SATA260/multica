@@ -992,7 +992,13 @@ func TestWritePiMcpExtensionIsolatesRegistrationErrorsAndLeavesProjectFile(t *te
 }
 
 func TestWritePiMcpExtensionSkipsUnmanagedAndEmpty(t *testing.T) {
-	for _, raw := range []json.RawMessage{nil, json.RawMessage("null"), json.RawMessage(`{}`), json.RawMessage(`{"mcpServers":{}}`)} {
+	for _, raw := range []json.RawMessage{
+		nil,
+		json.RawMessage("null"),
+		json.RawMessage(`{}`),
+		json.RawMessage(`{"mcpServers":{}}`),
+		json.RawMessage(`{"mcpServers":null}`),
+	} {
 		path, err := writePiMcpExtension(raw)
 		if err != nil {
 			t.Fatalf("writePiMcpExtension(%s): %v", raw, err)
@@ -1004,7 +1010,7 @@ func TestWritePiMcpExtensionSkipsUnmanagedAndEmpty(t *testing.T) {
 	}
 }
 
-func TestPreparePiMcpExtensionRejectsOldBuiltinOnlyWhenManaged(t *testing.T) {
+func TestPreparePiMcpExtensionRejectsOldBuiltinOnlyWhenServersPresent(t *testing.T) {
 	t.Setenv("TMPDIR", t.TempDir())
 	raw := json.RawMessage(`{"mcpServers":{"probe":{"command":"echo"}}}`)
 	backend := &piBackend{
@@ -1015,11 +1021,19 @@ func TestPreparePiMcpExtensionRejectsOldBuiltinOnlyWhenManaged(t *testing.T) {
 		},
 	}
 
-	path, err := backend.preparePiMcpExtension(nil)
-	if err != nil || path != "" {
-		t.Fatalf("unmanaged old Pi = (%q, %v), want no extension and no error", path, err)
+	for _, empty := range []json.RawMessage{
+		nil,
+		json.RawMessage("null"),
+		json.RawMessage(`{}`),
+		json.RawMessage(`{"mcpServers":{}}`),
+		json.RawMessage(`{"mcpServers":null}`),
+	} {
+		path, err := backend.preparePiMcpExtension(empty)
+		if err != nil || path != "" {
+			t.Fatalf("empty config %s on old Pi = (%q, %v), want no extension and no error", empty, path, err)
+		}
 	}
-	path, err = backend.preparePiMcpExtension(raw)
+	path, err := backend.preparePiMcpExtension(raw)
 	if err == nil {
 		removePiMcpExtension(path)
 		t.Fatal("managed MCP config was accepted by Pi below the MCP minimum")
