@@ -256,11 +256,11 @@ func TestProvisionDshMulticaProfile_ExitZeroWithoutAProfileIsAFailedCandidate(t 
 	}
 }
 
-// A refused install leaves a profile directory whose manifest does not name the
-// runtime. That directory is what makes later probes hang, so a failed candidate
-// removes it when the manifest is readable, names nothing of ours, and has no
-// dependencies of its own. Anything else is left where it is.
-func TestProvisionDshMulticaProfile_FailedInstallRemovesEmptySkeleton(t *testing.T) {
+// A refused install can leave a profile directory whose manifest does not name
+// the runtime. That directory stays. The manifest check already classifies it
+// as missing, so the next restart retries over it, and deleting it would also
+// remove files that were already there.
+func TestProvisionDshMulticaProfile_FailedInstallLeavesTheProfileDirectory(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fixture")
 	}
@@ -286,10 +286,59 @@ func TestProvisionDshMulticaProfile_FailedInstallRemovesEmptySkeleton(t *testing
 				t.Fatal("provision returned nil for a manifest that does not name the runtime")
 			}
 			dir := filepath.Join(os.Getenv("DSH_HOME"), "profiles", dshMulticaProfileName)
-			if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
-				t.Fatalf("profile dir = %v, want it removed", statErr)
+			got, readErr := os.ReadFile(filepath.Join(dir, "package.json"))
+			if readErr != nil {
+				t.Fatalf("profile manifest was removed: %v", readErr)
+			}
+			if string(got) != tc.manifest {
+				t.Fatalf("manifest = %q, want %q", got, tc.manifest)
+			}
+			config, readErr := os.ReadFile(filepath.Join(dir, "cordis.yml"))
+			if readErr != nil {
+				t.Fatalf("profile file written by the failed install was removed: %v", readErr)
+			}
+			if string(config) != "x\n" {
+				t.Fatalf("cordis.yml = %q, want the file the failed install wrote", config)
 			}
 		})
+	}
+}
+
+// A failed install that never touches an existing profile has no reason to
+// remove it. The directory may already hold the user's own files.
+func TestProvisionDshMulticaProfile_PreservesPreexistingProfileOnFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+	// An installer that fails without touching the profile, like an early network error.
+	dshPath, _ := fakeDshScript(t, "printf 'registry unreachable\\n' >&2\nexit 1")
+	t.Setenv(dshProfileBundleEnv, "@multica-ai/dsh-runtime")
+	t.Setenv(dshPluginPathEnv, "")
+	home := os.Getenv("DSH_HOME")
+	writeDshProfileManifest(t, home, dshSkeletonProfileManifest())
+	configPath := filepath.Join(home, "profiles", dshMulticaProfileName, "cordis.yml")
+	want := "# user-maintained profile configuration\nplugins: {}\n"
+	if err := os.WriteFile(configPath, []byte(want), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := provisionDshMulticaProfile(context.Background(), dshPath, logger); err == nil {
+		t.Fatal("expected failed install")
+	}
+	got, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("pre-existing user configuration was deleted after a failed install: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("pre-existing user configuration changed: %q", got)
+	}
+	manifestPath := filepath.Join(home, "profiles", dshMulticaProfileName, "package.json")
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("pre-existing manifest was deleted after a failed install: %v", err)
+	}
+	if string(manifest) != dshSkeletonProfileManifest() {
+		t.Fatalf("pre-existing manifest changed: %q", manifest)
 	}
 }
 

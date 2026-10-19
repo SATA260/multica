@@ -142,34 +142,6 @@ func dshProfileNamesRuntime(manifest dshProfileManifest) bool {
 	return false
 }
 
-// removeEmptyDshMulticaProfile deletes profiles/multica after a failed install
-// left a readable manifest that does not name the runtime and declares no
-// dependencies. A named runtime, any other dependency, or a file that cannot
-// be parsed is left in place.
-//
-// The bool is whether this call removed the directory.
-func removeEmptyDshMulticaProfile() (bool, error) {
-	path := dshMulticaProfileManifestPath()
-	if path == "" {
-		return false, nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false, nil
-	}
-	var manifest dshProfileManifest
-	if json.Unmarshal(data, &manifest) != nil {
-		return false, nil
-	}
-	if dshProfileNamesRuntime(manifest) || len(manifest.Dependencies) > 0 {
-		return false, nil
-	}
-	if err := os.RemoveAll(filepath.Dir(path)); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 // dshProfileBundleSpecs returns the configured install candidates, in order,
 // or nil when the operator has not opted in.
 func dshProfileBundleSpecs() []string {
@@ -385,16 +357,10 @@ func provisionDshMulticaProfile(ctx context.Context, dshPath string, logger *slo
 			lastErr = fmt.Errorf("dsh plugin --profile %s add (candidate %d of %d): %w: %s",
 				dshMulticaProfileName, i+1, len(specs), err, dshProvisionOutput(output))
 		}
-		// A refused add leaves a profile directory whose manifest does not name
-		// the runtime. Later probes hang on that directory, so drop it when it
-		// is the empty skeleton and nothing else.
-		if removed, rmErr := removeEmptyDshMulticaProfile(); rmErr != nil {
-			logger.Warn("failed to remove the empty DSH profile left by a failed install",
-				"profile", dshMulticaProfileName, "error", rmErr)
-		} else if removed {
-			logger.Info("removed the empty DSH profile left by a failed install",
-				"profile", dshMulticaProfileName)
-		}
+		// Leave the directory. A refused add can write a skeleton, and a failure
+		// can also land on a profile the user already had. dshMulticaProfilePresent
+		// treats a manifest that does not name the runtime as missing, so the
+		// next restart retries over it and --probe is not started.
 		logger.Warn("DSH runtime profile install failed",
 			"bundle_candidate", i+1, "candidates", len(specs), "error", lastErr)
 	}
